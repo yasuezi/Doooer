@@ -457,7 +457,7 @@ async function checkPaymentStatus(reference, amount) {
         return {
             success: true,
             data: {
-                status: 'PAID',
+                status: 'UNPAID',
                 amount: amount,
                 reference: reference
             }
