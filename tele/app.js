@@ -462,10 +462,7 @@ async function checkPaymentStatus(reference, amount) {
                 reference: reference
             }
         };
-    } catch (error) {
-        console.error('Error checking payment:', error);
-        throw error;
-    }
+    } 
 }
 
 function deleteUserData(userId) {
