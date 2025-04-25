@@ -483,7 +483,6 @@ bot.action('confirm_dor', async (ctx) => {
                         await sendMessage(ctx, messageTemplates.sessionEnd, unverifiedMenu);
                     } else {
                         throw new Error(dorResponse.data.message || "Gagal memproses DOR");
-                    }
                 } 
         }, 10000);
 
