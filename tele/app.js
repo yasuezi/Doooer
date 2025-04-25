@@ -7,6 +7,7 @@
 const { Telegraf } = require('telegraf');
 const fs = require('fs');
 const path = require('path');
+const QRCode = require('qrcode');
 const axios = require('axios');
 const dotenv = require('dotenv');
 const { createCanvas, loadImage } = require('canvas');
@@ -22,6 +23,13 @@ const CONFIG = {
     requestWindow: 60 * 60 * 1000,
     otpRequests: 3,
     otpWindow: 5 * 60 * 1000,
+    qrisConfig: {
+        merchantId: process.env.QRIS_MERCHANT_ID,
+        apiKey: process.env.QRIS_API_KEY,
+        basePrice: process.env.BASE_PRICE,
+        baseQrString: process.env.QRIS_BASE_QR_STRING,
+        logoPath: path.join(__dirname, 'logo.png')
+    },
     dorConfig: {
         apiUrl: 'https://api.tuyull.my.id/api/v1/dor',
         apiKey: process.env.DOR_API_KEY
@@ -146,9 +154,22 @@ const messageTemplates = {
 │ • Berlaku 5 menit
 ╰────────────────────────────╯`,
 
-    paymentSuccess: (reference, date) => `
-╭─〔〕──╮
+    paymentQR: (amount, reference) => `
+╭─〔 PEMBAYARAN 〕────────────╮
+│ 💰 Total: Rp ${amount}
+│ 📝 Ref: ${reference}
+│ ⏰ Batas: 5 menit
+│
+├─〔 PETUNJUK 〕─────────────
+│ 1. Scan QR
+│ 2. Bayar sesuai nominal
+│ 3. Tunggu konfirmasi
+╰────────────────────────────╯`,
+
+    paymentSuccess: (amount, reference, date) => `
+╭─〔 PEMBAYARAN DITERIMA 〕──╮
 │ ✅ Berhasil!
+│ 💰 Rp ${amount}
 │ 📝 Ref: ${reference}
 │ 🕒 ${date}
 │
@@ -393,6 +414,60 @@ bot.action('start_dor', async (ctx) => {
     });
 });
 
+async function checkPaymentStatus(reference, amount) {
+    try {
+        const response = await axios.get(
+            `https://gateway.okeconnect.com/api/mutasi/qris/${CONFIG.qrisConfig.merchantId}/${CONFIG.qrisConfig.apiKey}`
+        );
+        
+        if (response.data && response.data.status === "success" && response.data.data) {
+            const transactions = response.data.data;
+            const matchingTransactions = transactions.filter(tx => {
+                const txAmount = parseInt(tx.amount);
+                const txDate = new Date(tx.date);
+                const now = new Date();
+                const timeDiff = now - txDate;
+                return txAmount === amount && 
+                       tx.qris === "static" &&
+                       tx.type === "CR" &&
+                       timeDiff <= 5 * 60 * 1000;
+            });
+            
+            if (matchingTransactions.length > 0) {
+                const latestTransaction = matchingTransactions.reduce((latest, current) => {
+                    const currentDate = new Date(current.date);
+                    const latestDate = new Date(latest.date);
+                    return currentDate > latestDate ? current : latest;
+                });
+                
+                return {
+                    success: true,
+                    data: {
+                        status: 'PAID',
+                        amount: parseInt(latestTransaction.amount),
+                        reference: latestTransaction.issuer_reff,
+                        date: latestTransaction.date,
+                        brand_name: latestTransaction.brand_name,
+                        buyer_reff: latestTransaction.buyer_reff
+                    }
+                };
+            }
+        }
+        
+        return {
+            success: true,
+            data: {
+                status: 'UNPAID',
+                amount: amount,
+                reference: reference
+            }
+        };
+    } catch (error) {
+        console.error('Error checking payment:', error);
+        throw error;
+    }
+}
+
 function deleteUserData(userId) {
     try {
         const userData = loadUserData();
@@ -406,12 +481,63 @@ function deleteUserData(userId) {
     }
 }
 
+async function generateQRWithLogo(qrString) {
+    try {
+        const canvas = createCanvas(500, 500);
+        const ctx = canvas.getContext('2d');
+        await QRCode.toCanvas(canvas, qrString, {
+            errorCorrectionLevel: 'H',
+            margin: 2,
+            width: 500,
+            color: {
+                dark: '#000000',
+                light: '#ffffff'
+            }
+        });
+        
+        if (fs.existsSync(CONFIG.qrisConfig.logoPath)) {
+            const logo = await loadImage(CONFIG.qrisConfig.logoPath);
+            const logoSize = canvas.width * 0.25;
+            const logoPosition = (canvas.width - logoSize) / 2;
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(logoPosition - 5, logoPosition - 5, logoSize + 10, logoSize + 10);
+            ctx.drawImage(logo, logoPosition, logoPosition, logoSize, logoSize);
+        }
+        return canvas.toBuffer('image/png');
+    } catch (error) {
+        console.error('Error generating QR with logo:', error);
+        throw error;
+    }
+}
+
+function savePaymentData(userId, paymentData) {
+    const userData = loadUserData();
+    if (!userData[userId]) {
+        userData[userId] = {};
+    }
+    userData[userId].paymentData = paymentData;
+    saveUserData(userData);
+}
+
+function getPaymentData(userId) {
+    const userData = loadUserData();
+    return userData[userId]?.paymentData || null;
+}
+
+function removePaymentData(userId) {
+    const userData = loadUserData();
+    if (userData[userId] && userData[userId].paymentData) {
+        delete userData[userId].paymentData;
+        saveUserData(userData);
+    }
+}
+
 function escapeMarkdownV2(text) {
     return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
 function formatTransactionLog(data) {
-    const { phoneNumber, reference, date, username, userId } = data;
+    const { phoneNumber, amount, reference, date, username, userId } = data;
 
     const userLine = username
         ? `🔖 Username: @${username}`
@@ -419,6 +545,7 @@ function formatTransactionLog(data) {
 
     const message = `
 ╭─〔 TRANSAKSI BERHASIL 〕────────╮
+│ 💰 Jumlah: Rp ${amount}
 │ 📱 Nomor: ${phoneNumber}
 │ 🧾 Referensi: ${reference}
 │ ⏰ Waktu: ${date}
@@ -454,104 +581,75 @@ bot.action('confirm_dor', async (ctx) => {
         return;
     }
 
-    const reference = 'DOR' + Date.now();
-
-                    const dorData = {
-                        kode: "uts2",
-                        nama_paket: "Paket Kere Hore",
-                        nomor_hp: userData[userId].phoneNumber,
-                        payment: "pulsa",
-                        id_telegram: process.env.ID_TELEGRAM,
-                        password: process.env.PASSWORD,
-                        access_token: userData[userId].accessToken
-                    };
-
-                    const dorResponse = await axios.post(CONFIG.dorConfig.apiUrl, dorData, {
-                        headers: {
-                            'Authorization': CONFIG.dorConfig.apiKey
-                        }
-                    });
-
-                    if (dorResponse.data.status === "success") {
-                        await sendMessage(ctx, messageTemplates.dorSuccess(userData[userId].phoneNumber));
-                        deleteUserData(userId);
-                        
-                        if (messageTracker[userId]) {
-                            delete messageTracker[userId];
-                        }
-                        
-                        await sendMessage(ctx, messageTemplates.sessionEnd, unverifiedMenu);
-                    } else {
-                        throw new Error(dorResponse.data.message || "Gagal memproses DOR");
-                } 
-        }, 10000);
-
-    } catch (error) {
-        await sendMessage(ctx, messageTemplates.error(error.message), verifiedMenu);
-    }
-});
-
-bot.action('cancel_dor', async (ctx) => {
-    await sendMessage(ctx, '❌ DOR dibatalkan.', verifiedMenu);
-});
-
-function calculateCRC16(str) {
-    let crc = 0xFFFF;
-    for (let i = 0; i < str.length; i++) {
-        crc ^= str.charCodeAt(i) << 8;
-        for (let j = 0; j < 8; j++) {
-            if (crc & 0x8000) {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc = crc << 1;
-            }
-        }
-    }
-    return (crc & 0xFFFF).toString(16).toUpperCase().padStart(4, '0');
-}
-
-bot.action('hapus_otp', async (ctx) => {
-    try {
-        const userData = loadUserData();
-        const userId = ctx.from.id;
-        
-        if (!userData[userId]) {
-            await sendMessage(ctx, messageTemplates.error('Anda belum memiliki data OTP untuk dihapus.'), unverifiedMenu);
+    const existingPayment = getPaymentData(userId);
+    if (existingPayment && existingPayment.status === 'PENDING') {
+        const timeElapsed = Date.now() - existingPayment.timestamp;
+        if (timeElapsed < 5 * 60 * 1000) {
+            await sendMessage(ctx, messageTemplates.error('Anda masih memiliki pembayaran yang aktif. Mohon selesaikan atau tunggu 5 menit.'), verifiedMenu);
             return;
+        } else {
+            removePaymentData(userId);
         }
-
-        // Hapus data OTP dan verifikasi
-        delete userData[userId].phoneNumber;
-        delete userData[userId].verified;
-        delete userData[userId].accessToken;
-        delete userData[userId].otpData;
-        saveUserData(userData);
-
-        await sendMessage(ctx, `
-╭─〔 OTP DIHAPUS 〕──────────╮
-│ ✅ Data OTP berhasil dihapus
-│
-├─〔 PETUNJUK 〕─────────────
-│ 1. Klik "Minta OTP"
-│ 2. Masukkan nomor baru
-╰────────────────────────────╯`, unverifiedMenu);
-    } catch (error) {
-        await sendMessage(ctx, messageTemplates.error('Gagal menghapus data OTP. Silakan coba lagi.'), unverifiedMenu);
     }
-});
 
-bot.catch((err, ctx) => {
-    console.error('Error:', err);
-    ctx.reply(messageTemplates.error('Terjadi kesalahan. Silakan coba lagi nanti.'), unverifiedMenu);
-});
+    try {
+        const randomAmount = Math.floor(Math.random() * 99) + 1;
+        const totalAmount = CONFIG.qrisConfig.basePrice + randomAmount;
+        const reference = 'DOR' + Date.now();
+        const qrString = generateQrString(totalAmount);
+        
+        const qrBuffer = await generateQRWithLogo(qrString);
 
-bot.launch()
-    .then(() => {
-        console.log('Bot started successfully');
-    })
-    .catch((err) => {
-        console.error('Failed to start bot:', err);
-    });
+        const qrMessage = await ctx.replyWithPhoto(
+            { source: qrBuffer },
+            {
+                caption: messageTemplates.paymentQR(totalAmount.toLocaleString(), reference),
+                parse_mode: 'Markdown'
+            }
+        );
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM')); 
+        // Track the QR code message
+        messageTracker[userId] = qrMessage.message_id;
+
+        const paymentData = {
+            reference,
+            amount: totalAmount,
+            qrString,
+            timestamp: Date.now(),
+            status: 'PENDING',
+            messageId: qrMessage.message_id,
+            userId: userId
+        };
+        
+        savePaymentData(userId, paymentData);
+
+        let checkCount = 0;
+        const maxChecks = 30;
+        const checkInterval = setInterval(async () => {
+            try {
+                checkCount++;
+                const currentPaymentData = getPaymentData(userId);
+                
+                if (!currentPaymentData || currentPaymentData.status !== 'PENDING') {
+                    clearInterval(checkInterval);
+                    return;
+                }
+                
+                const status = await checkPaymentStatus(reference, totalAmount);
+                
+                if (status.data.status === 'PAID') {
+                    clearInterval(checkInterval);
+                    
+                    currentPaymentData.status = 'PAID';
+                    savePaymentData(userId, currentPaymentData);
+
+                    try {
+                        await ctx.deleteMessage(qrMessage.message_id).catch(err => {
+                            console.log(`Info: Tidak bisa menghapus QR code untuk user ${userId}`);
+                        });
+                    } catch (error) {
+                        console.log(`Info: Gagal menghapus QR code untuk user ${userId}`);
+                    }
+
+                    await sendMessage(ctx, messageTemplates.paymentSuccess(
+       
